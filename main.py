@@ -1,31 +1,30 @@
 from fastapi import FastAPI
-import os
 
 app = FastAPI()
 
+# Variable global de control (por seguridad inicia en False o True según prefieras)
+estado_agente = {
+    "activo": False,  # False por defecto para evitar ejecuciones accidentales en pruebas
+    "cuenta": "@otrabogota",
+    "mensaje": "El agente de Instagram está en la nube 24/7"
+}
+
 @app.get("/")
 def verificar_estado():
-    """Endpoint principal para verificar que el servidor está vivo en Render"""
+    # Devuelve el estado actual del agente
     return {
-        "estado": "activo",
-        "cuenta": "@otrabogota",
-        "mensaje": "El agente de Instagram está funcionando en la nube 24/7"
+        "estado": "activo" if estado_agente["activo"] else "pausado",
+        "cuenta": estado_agente["cuenta"],
+        "mensaje": estado_agente["mensaje"]
     }
 
-@app.post("/ejecutar-agente")
-def ejecutar_agente():
-    """
-    Aquí puedes disparar la lógica de tu agente de forma automática 
-    sin depender de la función input() de la consola.
-    """
-    try:
-        # Ejemplo de llamada a tus funciones existentes:
-        # comentarios = instagram.obtener_comentarios()
-        # respuesta = ia.generar_respuesta(comentarios)
-        
-        return {
-            "exito": True, 
-            "detalle": "El ciclo del agente se ejecutó correctamente."
-        }
-    except Exception as e:
-        return {"exito": False, "error": str(e)}
+@app.post("/cambiar-estado")
+def cambiar_estado(activar: bool):
+    # Recibe una orden desde la app para encender o apagar el agente
+    estado_agente["activo"] = activar
+    estado = "activo" if activar else "pausado"
+    return {
+        "resultado": "exito",
+        "nuevo_estado": estado,
+        "mensaje": f"El agente ha sido {estado} correctamente."
+    }
