@@ -5,7 +5,6 @@ from google import genai
 app = FastAPI()
 
 # Inicializar el cliente de Gemini usando la variable de entorno configurada en Render
-# (Asegúrate de agregar GEMINI_API_KEY en las Environment Variables de tu panel en Render)
 gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # Estado global de seguridad controlado por tu app Android
@@ -46,9 +45,9 @@ def ejecutar_agente(prompt_usuario: str):
         )
 
     try:
-        # Llamada inteligente a Gemini
+        # Llamada inteligente a Gemini con el modelo actualizado y sintaxis corregida
         response = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=f"Actúa como un agente experto para la cuenta de Instagram {estado_agente['cuenta']}. Responde a lo siguiente: {prompt_usuario}",
         )
 
