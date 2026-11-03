@@ -66,10 +66,14 @@ def simular_mensaje(datos: MensajeSimulado):
         )
         texto_borrador = response.text
 
+
     except Exception as e:
-        # PLAN DE CONTINGENCIA: Si Google falla, generamos un borrador rolo simulado localmente
-        # Esto evita que el curso se detenga y te permite probar toda la app de Android sin interrupciones.
-        texto_borrador = f"¡Quiubo, mi llave! Vi su mensaje sobre '{datos.texto_mensaje}'. ¡El parche en @otrabogota está activo y sonando fuerte! (Generado en Modo Contingencia por alta demanda de Google)"
+
+        # Imprimimos el error real en los logs de Render y lo mostramos en el borrador
+
+        print(f"Error detallado de Gemini: {e}")
+
+        texto_borrador = f"¡Quiubo, mi llave! Vi su mensaje sobre '{datos.usuario_origen}'. (Contingencia - Detalle del error: {str(e)})"
 
     # Creamos el borrador para la bandeja de aprobación humana
     nuevo_borrador = {
