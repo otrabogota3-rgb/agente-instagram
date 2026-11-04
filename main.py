@@ -59,21 +59,17 @@ def simular_mensaje(datos: MensajeSimulado):
     texto_borrador = ""
 
     try:
-        # Intentamos usar el modelo estándar disponible (gemini-1.5-flash)
+        # Usamos el modelo estándar y estable compatible con la nueva librería
         response = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.5-flash",
             contents=f"Actúa como un agente experto para la cuenta de Instagram {estado_agente['cuenta']}. Un usuario llamado {datos.usuario_origen} te escribió: '{datos.texto_mensaje}'. Redacta una respuesta amigable con acento rolo para responderle.",
         )
         texto_borrador = response.text
 
-
     except Exception as e:
-
-        # Imprimimos el error real en los logs de Render y lo mostramos en el borrador
-
+        # Mantenemos el bloque de error por si ocurre cualquier eventualidad de red
         print(f"Error detallado de Gemini: {e}")
-
-        texto_borrador = f"¡Quiubo, mi llave! Vi su mensaje sobre '{datos.usuario_origen}'. (Contingencia - Detalle del error: {str(e)})"
+        texto_borrador = f"¡Quiubo, mi llave! Vi su mensaje sobre '{datos.texto_mensaje}'. ¡El parche en @otrabogota está activo! (Modo Contingencia: {str(e)})"
 
     # Creamos el borrador para la bandeja de aprobación humana
     nuevo_borrador = {
