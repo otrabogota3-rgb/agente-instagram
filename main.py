@@ -10,7 +10,7 @@ gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
 # Estado global de seguridad controlado por tu app Android
 estado_agente = {
-    "activo": False,  # Inicia pausado por seguridad
+    "activo": True,  # Inicia pausado por seguridad
     "cuenta": "@otrabogota",
     "mensaje": "El agente inteligente está en la nube 24/7"
 }
@@ -68,7 +68,7 @@ def simular_mensaje(datos: MensajeSimulado):
 
     except Exception as e:
         print(f"Error detallado de Gemini: {e}")
-        texto_borrador = f"¡Quiubo, mi llave! Vi su mensaje sobre '{datos.texto_mensaje}'. ¡El parche en @otrabogota está activo! (Modo Contingencia: {str(e)})"
+        texto_borrador = f"¡Hola Veci! Vi tu mensaje sobre '{datos.texto_mensaje}'. ¡El parche en @otrabogota está activo! (Modo Contingencia: {str(e)})"
 
     # Creamos el borrador para la bandeja de aprobación humana
     nuevo_borrador = {
