@@ -69,6 +69,7 @@ def simular_mensaje(datos: MensajeSimulado):
     except Exception as e:
         print(f"Error detallado de Gemini: {e}")
         texto_borrador = f"¡Quiubo, mi llave! Vi su mensaje sobre '{datos.texto_mensaje}'. ¡El parche en @otrabogota está activo! (Modo Contingencia: {str(e)})"
+
     # Creamos el borrador para la bandeja de aprobación humana
     nuevo_borrador = {
         "id_mensaje": len(bandeja_borradores) + 1,
