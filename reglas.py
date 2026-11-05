@@ -1,16 +1,30 @@
 """Reglas fijas: respuestas confiables para preguntas frecuentes."""
+import re
 import unicodedata
 
-# El orden importa: se usa la primera coincidencia.
-# Las palabras clave van en minúsculas y SIN tildes.
-REGLAS = {
-    "envio": "Hacemos domicilios gratis en Bogotá.",
-    "domicilio": "Hacemos domicilios gratis en Bogotá.",
-    "precio": "¡Hola! Te enviamos el precio por mensaje directo.",
-    "cuesta": "¡Hola! Te enviamos el precio por mensaje directo.",
-    "horario": "Atendemos de lunes a sábado de 9 a 6.",
-    "ubicad": "Estamos ubicados en Bogotá. Te enviamos la dirección por mensaje directo.",
-}
+# El orden importa: gana la primera regla que coincida.
+# Cada regla es una pareja: (palabras que la activan, respuesta).
+# Las palabras van en minúsculas y SIN tildes, y se comparan COMPLETAS:
+# "precio" activa la regla, pero "preciosa" no.
+# Por eso se escriben las variantes (singular y plural) de forma explícita.
+REGLAS = [
+    (
+        ("envio", "envios", "domicilio", "domicilios"),
+        "Hacemos domicilios gratis en Bogotá.",  # TEXTO DE PRUEBA: reemplazar por el real
+    ),
+    (
+        ("precio", "precios", "cuesta", "cuestan"),
+        "¡Hola! Te enviamos el precio por mensaje directo.",
+    ),
+    (
+        ("horario", "horarios"),
+        "Atendemos de lunes a sábado de 9 a 6.",  # TEXTO DE PRUEBA: reemplazar por el real
+    ),
+    (
+        ("ubicacion", "ubicado", "ubicada", "ubicados", "ubicadas"),
+        "Estamos ubicados en Bogotá. Te enviamos la dirección por mensaje directo.",
+    ),
+]
 
 RESPUESTA_EMOJIS = "¡Gracias por apoyarnos! 🫶"
 
@@ -43,8 +57,12 @@ def buscar_regla(comentario):
     """Devuelve la respuesta fija que corresponda, o None si ninguna aplica."""
     if es_solo_emojis(comentario):
         return RESPUESTA_EMOJIS
-    texto = normalizar(comentario)
-    for palabra, respuesta in REGLAS.items():
-        if palabra in texto:
+
+    # Se separa el comentario en palabras sueltas: "¿Cuánto cuesta?" -> {"cuanto", "cuesta"}
+    palabras = set(re.findall(r"\w+", normalizar(comentario)))
+
+    for claves, respuesta in REGLAS:
+        # Hay coincidencia si el comentario tiene AL MENOS UNA palabra de la regla
+        if palabras & set(claves):
             return respuesta
     return None

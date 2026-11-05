@@ -1,152 +1,196 @@
+"""
+Servidor del agente de @otrabogota (FastAPI).
+
+Es el "mesero" entre la app Android y el cerebro en Python:
+- Recibe comentarios, pide la respuesta sugerida al cerebro (reglas fijas + Gemini)
+  y la guarda como BORRADOR en una bandeja.
+- La app Android muestra los borradores y el humano decide: aprobar, editar o rechazar.
+- IMPORTANTE: por ahora NADA se publica en Instagram. Aprobar solo cambia el estado.
+
+Seguridad:
+- El agente arranca PAUSADO.
+- Todos los endpoints (menos "/") exigen la cabecera X-API-Key con la clave secreta
+  guardada en la variable de entorno AGENTE_API_KEY.
+"""
+
+import itertools
 import os
-from fastapi import FastAPI, HTTPException
-from google import genai
-from pydantic import BaseModel
+import secrets
+from typing import Optional
 
-app = FastAPI()
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import APIKeyHeader
+from pydantic import BaseModel, Field
 
-# Inicializar el cliente de Gemini
-gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+import aprobacion
+import config
 
-# Estado global de seguridad controlado por tu app Android
+# Falla al arrancar (y no más tarde) si falta la clave de Gemini.
+config.verificar()
+
+app = FastAPI(title="Agente @otrabogota")
+
+# ---------------------------------------------------------------------------
+# Estado en memoria (se pierde si el servidor se reinicia)
+# ---------------------------------------------------------------------------
 estado_agente = {
-    "activo": True,  # Inicia pausado por seguridad
+    "activo": False,  # Arranca pausado por seguridad
     "cuenta": "@otrabogota",
-    "mensaje": "El agente inteligente está en la nube 24/7"
 }
 
-# Bandeja temporal de borradores pendientes de aprobación humana
 bandeja_borradores = []
+_contador_ids = itertools.count(1)  # 1, 2, 3, ... sin repetir
+
+# Tope de seguridad para los textos (evita mensajes enormes que cuesten dinero en Gemini)
+_MAX_TEXTO = 2200
 
 
+# ---------------------------------------------------------------------------
+# Seguridad: clave secreta en la cabecera X-API-Key
+# ---------------------------------------------------------------------------
+_esquema_clave = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+def exigir_clave(clave_recibida: Optional[str] = Security(_esquema_clave)):
+    """Deja pasar solo las peticiones que traen la clave correcta."""
+    clave_esperada = os.getenv("AGENTE_API_KEY")
+
+    # Si el servidor no tiene clave configurada, se bloquea TODO (más seguro que dejar abierto)
+    if not clave_esperada:
+        raise HTTPException(status_code=503, detail="El servidor no tiene AGENTE_API_KEY configurada.")
+
+    # compare_digest compara sin dar pistas por el tiempo que tarda
+    if not clave_recibida or not secrets.compare_digest(
+        clave_recibida.encode("utf-8"), clave_esperada.encode("utf-8")
+    ):
+        raise HTTPException(status_code=401, detail="Clave inválida o ausente.")
+
+
+# ---------------------------------------------------------------------------
+# Modelos de datos (lo que el servidor acepta recibir)
+# ---------------------------------------------------------------------------
 class MensajeSimulado(BaseModel):
-    usuario_origen: str
-    texto_mensaje: str
+    usuario_origen: str = Field(min_length=1, max_length=100)
+    texto_mensaje: str = Field(min_length=1, max_length=_MAX_TEXTO)
 
 
 class DatosEdicion(BaseModel):
-    nuevo_texto: str
+    nuevo_texto: str = Field(min_length=1, max_length=_MAX_TEXTO)
 
 
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+def _buscar_borrador(id_mensaje):
+    """Devuelve el borrador pendiente o lanza el error HTTP que corresponda."""
+    borrador = next((b for b in bandeja_borradores if b["id_mensaje"] == id_mensaje), None)
+    if not borrador:
+        raise HTTPException(status_code=404, detail="Borrador no encontrado.")
+    if borrador["estado"] != "pendiente_aprobacion":
+        raise HTTPException(status_code=400, detail="Este borrador ya fue procesado anteriormente.")
+    return borrador
+
+
+def _exigir_agente_activo():
+    """Aprobar equivale a publicar, así que no se permite con el agente pausado."""
+    if not estado_agente["activo"]:
+        raise HTTPException(status_code=403, detail="Acción bloqueada: el agente está PAUSADO.")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
 @app.get("/")
 def verificar_estado():
+    """Público a propósito (Render lo usa para saber si el servidor está vivo). No muestra datos sensibles."""
     return {
         "estado": "activo" if estado_agente["activo"] else "pausado",
         "cuenta": estado_agente["cuenta"],
-        "mensaje": estado_agente["mensaje"]
     }
 
 
-@app.post("/cambiar-estado")
+@app.post("/cambiar-estado", dependencies=[Depends(exigir_clave)])
 def cambiar_estado(activar: bool):
     estado_agente["activo"] = activar
     estado = "activo" if activar else "pausado"
-    return {
-        "resultado": "exito",
-        "nuevo_estado": estado,
-        "mensaje": f"El agente ha sido {estado} correctamente."
-    }
+    return {"resultado": "exito", "nuevo_estado": estado}
 
 
-@app.post("/simular-mensaje")
+@app.post("/simular-mensaje", dependencies=[Depends(exigir_clave)])
 def simular_mensaje(datos: MensajeSimulado):
     if not estado_agente["activo"]:
         raise HTTPException(
             status_code=403,
-            detail="Acción bloqueada: El agente se encuentra PAUSADO. No se pueden procesar mensajes."
+            detail="Acción bloqueada: el agente está PAUSADO. No se pueden procesar mensajes.",
         )
 
-    texto_borrador = ""
+    # El cerebro decide: emojis -> regla fija -> Gemini -> respuesta de respaldo.
+    # Nunca devuelve el texto de un error técnico.
+    sugerencia = aprobacion.obtener_respuesta_sugerida(datos.texto_mensaje)
 
-    try:
-        # Usamos el modelo exacto que nos exige la API de Google
-        response = gemini_client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=f"Actúa como un agente experto para la cuenta de Instagram {estado_agente['cuenta']}. Un usuario llamado {datos.usuario_origen} te escribió: '{datos.texto_mensaje}'. Redacta una respuesta amigable con acento rolo para responderle.",
-        )
-        texto_borrador = response.text
-
-    except Exception as e:
-        print(f"Error detallado de Gemini: {e}")
-        texto_borrador = f"¡Hola Veci! Vi tu mensaje sobre '{datos.texto_mensaje}'. ¡El parche en @otrabogota está activo! (Modo Contingencia: {str(e)})"
-
-    # Creamos el borrador para la bandeja de aprobación humana
     nuevo_borrador = {
-        "id_mensaje": len(bandeja_borradores) + 1,
+        "id_mensaje": next(_contador_ids),
         "usuario": datos.usuario_origen,
         "mensaje_recibido": datos.texto_mensaje,
-        "borrador_gemini": texto_borrador,
-        "estado": "pendiente_aprobacion"
+        "borrador_gemini": sugerencia,
+        "estado": "pendiente_aprobacion",
     }
-
     bandeja_borradores.append(nuevo_borrador)
 
     return {
         "resultado": "borrador_creado",
         "advertencia": "El mensaje NO se ha publicado en Instagram. Está esperando aprobación humana.",
-        "detalle_borrador": nuevo_borrador
+        "detalle_borrador": nuevo_borrador,
     }
 
 
-@app.get("/ver-pendientes")
+@app.get("/ver-pendientes", dependencies=[Depends(exigir_clave)])
 def ver_pendientes():
+    pendientes = [b for b in bandeja_borradores if b["estado"] == "pendiente_aprobacion"]
     return {
         "cuenta": estado_agente["cuenta"],
-        "total_pendientes": len([b for b in bandeja_borradores if b["estado"] == "pendiente_aprobacion"]),
-        "bandeja": [b for b in bandeja_borradores if b["estado"] == "pendiente_aprobacion"]
+        "total_pendientes": len(pendientes),
+        "bandeja": pendientes,
     }
 
 
-@app.post("/aprobar-borrador/{id_mensaje}")
+@app.post("/aprobar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
 def aprobar_borrador(id_mensaje: int):
-    # Buscamos el borrador en la bandeja
-    borrador = next((b for b in bandeja_borradores if b["id_mensaje"] == id_mensaje), None)
+    _exigir_agente_activo()
+    borrador = _buscar_borrador(id_mensaje)
 
-    if not borrador:
-        raise HTTPException(status_code=404, detail="Borrador no encontrado.")
-
-    if borrador["estado"] != "pendiente_aprobacion":
-        raise HTTPException(status_code=400, detail="Este borrador ya fue procesado anteriormente.")
-
-    # Cambiamos su estado a aprobado (Aquí en el futuro se conectará con la API de Instagram)
-    borrador["estado"] = "aprobado_y_enviado"
+    # Todavía no se conecta con Instagram: solo se marca como aprobado.
+    borrador["estado"] = "aprobado"
 
     return {
         "resultado": "exito",
-        "mensaje": f"¡Borrador #{id_mensaje} aprobado por el humano y enviado a Instagram con éxito!",
-        "contenido_enviado": borrador["borrador_gemini"]
+        "mensaje": f"Borrador #{id_mensaje} aprobado. Aún NO se publica en Instagram (modo simulación).",
+        "contenido_aprobado": borrador["borrador_gemini"],
     }
 
 
-@app.post("/editar-borrador/{id_mensaje}")
+@app.post("/editar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
 def editar_borrador(id_mensaje: int, datos: DatosEdicion):
-    borrador = next((b for b in bandeja_borradores if b["id_mensaje"] == id_mensaje), None)
+    _exigir_agente_activo()
+    borrador = _buscar_borrador(id_mensaje)
 
-    if not borrador:
-        raise HTTPException(status_code=404, detail="Borrador no encontrado.")
-
-    # Actualizamos el texto con la corrección del humano
-    borrador["borrador_gemini"] = datos.nuevo_texto
+    borrador["borrador_gemini"] = datos.nuevo_texto.strip()
     borrador["estado"] = "editado_y_aprobado"
 
     return {
         "resultado": "exito",
-        "mensaje": f"¡Borrador #{id_mensaje} editado y aprobado por el humano!",
-        "nuevo_contenido": borrador["borrador_gemini"]
+        "mensaje": f"Borrador #{id_mensaje} editado y aprobado. Aún NO se publica en Instagram (modo simulación).",
+        "contenido_aprobado": borrador["borrador_gemini"],
     }
 
 
-@app.post("/rechazar-borrador/{id_mensaje}")
+@app.post("/rechazar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
 def rechazar_borrador(id_mensaje: int):
-    borrador = next((b for b in bandeja_borradores if b["id_mensaje"] == id_mensaje), None)
-
-    if not borrador:
-        raise HTTPException(status_code=404, detail="Borrador no encontrado.")
-
-    # Eliminamos o descartamos el borrador
+    # Rechazar se permite aunque el agente esté pausado: es la acción más segura.
+    borrador = _buscar_borrador(id_mensaje)
     borrador["estado"] = "rechazado"
 
     return {
         "resultado": "exito",
-        "mensaje": f"El borrador #{id_mensaje} fue descartado y rechazado correctamente. No se publicará nada."
+        "mensaje": f"Borrador #{id_mensaje} rechazado. No se publicará nada.",
     }
