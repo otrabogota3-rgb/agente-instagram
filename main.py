@@ -8,7 +8,6 @@ Es el "mesero" entre la app Android y el cerebro en Python:
 - IMPORTANTE: por ahora NADA se publica en Instagram. Aprobar solo cambia el estado.
 
 Seguridad:
-- El agente arranca PAUSADO.
 - Todos los endpoints (menos "/") exigen la cabecera X-API-Key con la clave secreta
   guardada en la variable de entorno AGENTE_API_KEY.
 """
@@ -34,7 +33,7 @@ app = FastAPI(title="Agente @otrabogota")
 # Estado en memoria (se pierde si el servidor se reinicia)
 # ---------------------------------------------------------------------------
 estado_agente = {
-    "activo": False,  # Arranca pausado por seguridad
+    "activo": True,  # Activado por defecto para facilitar las pruebas con la app
     "cuenta": "@otrabogota",
 }
 
@@ -102,7 +101,7 @@ def _exigir_agente_activo():
 # ---------------------------------------------------------------------------
 @app.get("/")
 def verificar_estado():
-    """Público a propósito (Render lo usa para saber si el servidor está vivo). No muestra datos sensibles."""
+    """Público a propósito. No muestra datos sensibles."""
     return {
         "estado": "activo" if estado_agente["activo"] else "pausado",
         "cuenta": estado_agente["cuenta"],
@@ -124,8 +123,6 @@ def simular_mensaje(datos: MensajeSimulado):
             detail="Acción bloqueada: el agente está PAUSADO. No se pueden procesar mensajes.",
         )
 
-    # El cerebro decide: emojis -> regla fija -> Gemini -> respuesta de respaldo.
-    # Nunca devuelve el texto de un error técnico.
     sugerencia = aprobacion.obtener_respuesta_sugerida(datos.texto_mensaje)
 
     nuevo_borrador = {
@@ -159,7 +156,6 @@ def aprobar_borrador(id_mensaje: int):
     _exigir_agente_activo()
     borrador = _buscar_borrador(id_mensaje)
 
-    # Todavía no se conecta con Instagram: solo se marca como aprobado.
     borrador["estado"] = "aprobado"
 
     return {
@@ -186,7 +182,6 @@ def editar_borrador(id_mensaje: int, datos: DatosEdicion):
 
 @app.post("/rechazar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
 def rechazar_borrador(id_mensaje: int):
-    # Rechazar se permite aunque el agente esté pausado: es la acción más segura.
     borrador = _buscar_borrador(id_mensaje)
     borrador["estado"] = "rechazado"
 
