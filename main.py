@@ -2,8 +2,8 @@
 Servidor del agente de @otrabogota (FastAPI).
 
 Es el "mesero" entre la app Android y el cerebro en Python:
-- Recibe comentarios, pide la respuesta sugerida al cerebro (reglas fijas + Gemini)
-  y la guarda como BORRADOR en una bandeja.
+- Recibe comentarios (junto con el contexto del post), pide la respuesta sugerida
+  al cerebro (reglas fijas + Gemini) y la guarda como BORRADOR en una bandeja.
 - La app Android muestra los borradores y el humano decide: aprobar, editar o rechazar.
 - IMPORTANTE: por ahora NADA se publica en Instagram. Aprobar solo cambia el estado.
 
@@ -71,6 +71,7 @@ def exigir_clave(clave_recibida: Optional[str] = Security(_esquema_clave)):
 class MensajeSimulado(BaseModel):
     usuario_origen: str = Field(min_length=1, max_length=100)
     texto_mensaje: str = Field(min_length=1, max_length=_MAX_TEXTO)
+    post_caption: Optional[str] = Field(default="Publicación de @otrabogota", max_length=500)
 
 
 class DatosEdicion(BaseModel):
@@ -123,7 +124,8 @@ def simular_mensaje(datos: MensajeSimulado):
             detail="Acción bloqueada: el agente está PAUSADO. No se pueden procesar mensajes.",
         )
 
-    sugerencia = aprobacion.obtener_respuesta_sugerida(datos.texto_mensaje)
+    # Pasamos el comentario y el caption del post a la lógica de aprobación
+    sugerencia = aprobacion.obtener_respuesta_sugerida(datos.texto_mensaje, datos.post_caption)
 
     nuevo_borrador = {
         "id_mensaje": next(_contador_ids),
@@ -131,6 +133,7 @@ def simular_mensaje(datos: MensajeSimulado):
         "mensaje_recibido": datos.texto_mensaje,
         "borrador_gemini": sugerencia,
         "estado": "pendiente_aprobacion",
+        "post_caption": datos.post_caption,  # <--- Contexto guardado para la App Android
     }
     bandeja_borradores.append(nuevo_borrador)
 
