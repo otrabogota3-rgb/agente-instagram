@@ -2,31 +2,42 @@
 import re
 import unicodedata
 
+# Respuesta neutra: no afirma nada, no promete nada, solo manda a DM.
+# Mientras no tengas los datos REALES (precios, domicilios, horarios, dirección),
+# TODAS las reglas usan esta respuesta. Así nunca se aprueba un dato inventado.
+RESPUESTA_DM = "Gracias por preguntar. Te escribimos por DM."
+
 # El orden importa: gana la primera regla que coincida.
 # Cada regla es una pareja: (palabras que la activan, respuesta).
 # Las palabras van en minúsculas y SIN tildes, y se comparan COMPLETAS:
 # "precio" activa la regla, pero "preciosa" no.
 # Por eso se escriben las variantes (singular y plural) de forma explícita.
+#
+# CUANDO TENGAS UN DATO REAL, cambia RESPUESTA_DM de esa regla por el texto verdadero.
+# Ejemplo: en la regla de horario, escribe el horario de verdad.
 REGLAS = [
     (
         ("envio", "envios", "domicilio", "domicilios"),
-        "Hacemos domicilios gratis en Bogotá.",  # TEXTO DE PRUEBA: reemplazar por el real
+        RESPUESTA_DM,
     ),
     (
         ("precio", "precios", "cuesta", "cuestan"),
-        "¡Hola! Te enviamos el precio por mensaje directo.",
+        RESPUESTA_DM,
     ),
     (
         ("horario", "horarios"),
-        "Atendemos de lunes a sábado de 9 a 6.",  # TEXTO DE PRUEBA: reemplazar por el real
+        RESPUESTA_DM,
     ),
     (
+        # "ubicación" puede significar dónde se tomó la foto o dónde queda un local:
+        # en los dos casos la respuesta segura es mandar a DM.
         ("ubicacion", "ubicado", "ubicada", "ubicados", "ubicadas"),
-        "Estamos ubicados en Bogotá. Te enviamos la dirección por mensaje directo.",
+        RESPUESTA_DM,
     ),
 ]
 
-RESPUESTA_EMOJIS = "¡Gracias por apoyarnos! 🫶"
+# Para comentarios que solo traen emojis. Va en la voz de la cuenta, sin frases de empresa.
+RESPUESTA_EMOJIS = "Bogotá en su punto 🫶"
 
 # Categorías Unicode que forman parte de un emoji (símbolo, modificador, unión)
 _CATEGORIAS_EMOJI = ("So", "Sk", "Mn", "Cf")

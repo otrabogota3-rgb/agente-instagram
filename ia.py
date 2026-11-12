@@ -57,7 +57,7 @@ def generar_respuesta(comentario_texto):
         try:
             respuesta = cliente.models.generate_content(
                 model=config.MODELO_GEMINI,
-                contents=comentario_texto,
+                contents=f"<comentario>\n{comentario_texto}\n</comentario>",
                 config=types.GenerateContentConfig(
                     system_instruction=config.PROMPT_SISTEMA_INSTAGRAM,
                     temperature=0.3,

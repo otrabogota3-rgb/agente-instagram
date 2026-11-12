@@ -10,6 +10,7 @@ Es el "mesero" entre la app Android y el cerebro en Python:
 Seguridad:
 - Todos los endpoints (menos "/") exigen la cabecera X-API-Key con la clave secreta
   guardada en la variable de entorno AGENTE_API_KEY.
+- El agente arranca PAUSADO, salvo que exista AGENTE_ACTIVO_AL_INICIAR=true (solo pruebas locales).
 """
 
 import itertools
@@ -33,7 +34,10 @@ app = FastAPI(title="Agente @otrabogota")
 # Estado en memoria (se pierde si el servidor se reinicia)
 # ---------------------------------------------------------------------------
 estado_agente = {
-    "activo": True,  # Activado por defecto para facilitar las pruebas con la app
+    # Arranca PAUSADO por seguridad. Para que arranque activo (solo en pruebas locales),
+    # agrega AGENTE_ACTIVO_AL_INICIAR=true en tu archivo .env. En Render NO se define,
+    # así que ahí siempre arranca pausado, también después de un reinicio.
+    "activo": os.getenv("AGENTE_ACTIVO_AL_INICIAR", "false").strip().lower() == "true",
     "cuenta": "@otrabogota",
 }
 
