@@ -1,68 +1,73 @@
 """
 Servidor del agente de @otrabogota (FastAPI).
 
-Es el "mesero" entre la app Android y el cerebro en Python:
-- Recibe comentarios (junto con el contexto del post), pide la respuesta sugerida
-  al cerebro (reglas fijas + Gemini) y la guarda como BORRADOR en una bandeja.
+Es el "mesero" entre la app Android, Instagram (Meta) y el cerebro en Python:
+- Recibe comentarios/mensajes (simulados o vía Webhook real de Meta), pide la respuesta
+  sugerida al cerebro en segundo plano (BackgroundTasks) y la guarda en SQLite.
+- Garantiza idempotencia mediante instagram_message_id para evitar duplicados si Meta reintenta.
 - La app Android muestra los borradores y el humano decide: aprobar, editar o rechazar.
-- IMPORTANTE: por ahora NADA se publica en Instagram. Aprobar solo cambia el estado.
-
-Seguridad:
-- Todos los endpoints (menos "/") exigen la cabecera X-API-Key con la clave secreta
-  guardada en la variable de entorno AGENTE_API_KEY.
-- El agente arranca PAUSADO, salvo que exista AGENTE_ACTIVO_AL_INICIAR=true (solo pruebas locales).
 """
 
-import itertools
 import os
 import secrets
+from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi.responses import PlainTextResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 
 import aprobacion
 import config
+from database import AsyncSessionLocal, Base, engine, get_db
+from models import MensajePendienteDB
 
 # Falla al arrancar (y no más tarde) si falta la clave de Gemini.
 config.verificar()
 
-app = FastAPI(title="Agente @otrabogota")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    print("Base de datos SQLite inicializada correctamente.")
+    yield
+
+
+# ÚNICA instancia de FastAPI con el lifespan integrado
+app = FastAPI(lifespan=lifespan)
+
 
 # ---------------------------------------------------------------------------
-# Estado en memoria (se pierde si el servidor se reinicia)
+# Estado en memoria (arranca PAUSADO por seguridad en producción)
 # ---------------------------------------------------------------------------
 estado_agente = {
-    # Arranca PAUSADO por seguridad. Para que arranque activo (solo en pruebas locales),
-    # agrega AGENTE_ACTIVO_AL_INICIAR=true en tu archivo .env. En Render NO se define,
-    # así que ahí siempre arranca pausado, también después de un reinicio.
     "activo": os.getenv("AGENTE_ACTIVO_AL_INICIAR", "false").strip().lower() == "true",
     "cuenta": "@otrabogota",
 }
 
-bandeja_borradores = []
-_contador_ids = itertools.count(1)  # 1, 2, 3, ... sin repetir
-
-# Tope de seguridad para los textos (evita mensajes enormes que cuesten dinero en Gemini)
 _MAX_TEXTO = 2200
 
 
 # ---------------------------------------------------------------------------
-# Seguridad: clave secreta en la cabecera X-API-Key
+# Seguridad: clave secreta en la cabecera X-API-Key (para tu App Android)
 # ---------------------------------------------------------------------------
 _esquema_clave = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def exigir_clave(clave_recibida: Optional[str] = Security(_esquema_clave)):
-    """Deja pasar solo las peticiones que traen la clave correcta."""
+    """Deja pasar solo las peticiones de la App Android que traen la clave correcta."""
     clave_esperada = os.getenv("AGENTE_API_KEY")
 
-    # Si el servidor no tiene clave configurada, se bloquea TODO (más seguro que dejar abierto)
     if not clave_esperada:
-        raise HTTPException(status_code=503, detail="El servidor no tiene AGENTE_API_KEY configurada.")
+        raise HTTPException(
+            status_code=503,
+            detail="El servidor no tiene AGENTE_API_KEY configurada.",
+        )
 
-    # compare_digest compara sin dar pistas por el tiempo que tarda
     if not clave_recibida or not secrets.compare_digest(
         clave_recibida.encode("utf-8"), clave_esperada.encode("utf-8")
     ):
@@ -70,12 +75,14 @@ def exigir_clave(clave_recibida: Optional[str] = Security(_esquema_clave)):
 
 
 # ---------------------------------------------------------------------------
-# Modelos de datos (lo que el servidor acepta recibir)
+# Modelos de datos
 # ---------------------------------------------------------------------------
 class MensajeSimulado(BaseModel):
     usuario_origen: str = Field(min_length=1, max_length=100)
     texto_mensaje: str = Field(min_length=1, max_length=_MAX_TEXTO)
-    post_caption: Optional[str] = Field(default="Publicación de @otrabogota", max_length=500)
+    post_caption: Optional[str] = Field(
+        default="Publicación de @otrabogota", max_length=500
+    )
 
 
 class DatosEdicion(BaseModel):
@@ -83,36 +90,158 @@ class DatosEdicion(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Utilidades
+# Utilidades de Base de Datos
 # ---------------------------------------------------------------------------
-def _buscar_borrador(id_mensaje):
-    """Devuelve el borrador pendiente o lanza el error HTTP que corresponda."""
-    borrador = next((b for b in bandeja_borradores if b["id_mensaje"] == id_mensaje), None)
+async def _buscar_borrador(db: AsyncSession, id_mensaje: int):
+    resultado = await db.execute(
+        select(MensajePendienteDB).filter_by(id=id_mensaje)
+    )
+    borrador = resultado.scalars().first()
+
     if not borrador:
         raise HTTPException(status_code=404, detail="Borrador no encontrado.")
-    if borrador["estado"] != "pendiente_aprobacion":
-        raise HTTPException(status_code=400, detail="Este borrador ya fue procesado anteriormente.")
+    if borrador.status != "pending":
+        raise HTTPException(
+            status_code=400,
+            detail="Este borrador ya fue procesado anteriormente.",
+        )
     return borrador
 
 
 def _exigir_agente_activo():
-    """Aprobar equivale a publicar, así que no se permite con el agente pausado."""
     if not estado_agente["activo"]:
-        raise HTTPException(status_code=403, detail="Acción bloqueada: el agente está PAUSADO.")
+        raise HTTPException(
+            status_code=403, detail="Acción bloqueada: el agente está PAUSADO."
+        )
 
 
 # ---------------------------------------------------------------------------
-# Endpoints
+# Tarea en Segundo Plano (BackgroundTask) para IA y SQLite
+# ---------------------------------------------------------------------------
+async def procesar_y_guardar_borrador(
+    ig_message_id: str,
+    sender_id: str,
+    user_message: str,
+    post_caption: str,
+):
+    async with AsyncSessionLocal() as db:
+        try:
+            existe = await db.execute(
+                select(MensajePendienteDB).filter_by(instagram_message_id=ig_message_id)
+            )
+            if existe.scalars().first():
+                print(f"[Webhook] Mensaje duplicado ignorado: {ig_message_id}")
+                return
+
+            sugerencia = aprobacion.obtener_respuesta_sugerida(
+                user_message, post_caption
+            )
+
+            nuevo_borrador = MensajePendienteDB(
+                instagram_message_id=ig_message_id,
+                sender_id=sender_id,
+                user_message=user_message[:_MAX_TEXTO],
+                draft_response=sugerencia,
+                post_caption=post_caption,
+                status="pending",
+            )
+            db.add(nuevo_borrador)
+            await db.commit()
+            print(f"[Webhook] Borrador guardado con éxito para mensaje {ig_message_id}")
+
+        except Exception as e:
+            await db.rollback()
+            print(f"[Error BackgroundTask] Falló el procesamiento de {ig_message_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Endpoints Públicos y Webhooks de Meta
 # ---------------------------------------------------------------------------
 @app.get("/")
 def verificar_estado():
-    """Público a propósito. No muestra datos sensibles."""
     return {
         "estado": "activo" if estado_agente["activo"] else "pausado",
         "cuenta": estado_agente["cuenta"],
     }
 
 
+@app.get("/webhook")
+def verificar_webhook_meta(
+    hub_mode: Optional[str] = Query(None, alias="hub.mode"),
+    hub_verify_token: Optional[str] = Query(None, alias="hub.verify_token"),
+    hub_challenge: Optional[str] = Query(None, alias="hub.challenge"),
+):
+    """Endpoint que Meta consulta una sola vez al configurar el Webhook."""
+    token_esperado = os.getenv("META_VERIFY_TOKEN")
+    if (
+        hub_mode == "subscribe"
+        and token_esperado
+        and hub_verify_token == token_esperado
+    ):
+        return PlainTextResponse(content=hub_challenge or "", status_code=200)
+    raise HTTPException(status_code=403, detail="Token de verificación inválido.")
+
+
+@app.post("/webhook")
+async def recibir_webhook_meta(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    payload = await request.json()
+
+    if not estado_agente["activo"]:
+        return {"status": "ignored", "reason": "agente_pausado"}
+
+    for entry in payload.get("entry", []):
+        for messaging in entry.get("messaging", []):
+            mensaje = messaging.get("message", {})
+            if mensaje.get("is_echo"):
+                continue
+
+            msg_id = mensaje.get("mid")
+            texto = mensaje.get("text")
+            sender_id = messaging.get("sender", {}).get("id", "usuario_ig")
+
+            if msg_id and texto:
+                existe = await db.execute(
+                    select(MensajePendienteDB).filter_by(instagram_message_id=msg_id)
+                )
+                if not existe.scalars().first():
+                    background_tasks.add_task(
+                        procesar_y_guardar_borrador,
+                        ig_message_id=msg_id,
+                        sender_id=sender_id,
+                        user_message=texto,
+                        post_caption="Mensaje directo (DM) a @otrabogota",
+                    )
+
+        for change in entry.get("changes", []):
+            if change.get("field") == "comments":
+                valor = change.get("value", {})
+                comment_id = valor.get("id")
+                texto = valor.get("text")
+                sender_id = valor.get("from", {}).get("username", "comentarista_ig")
+
+                if comment_id and texto:
+                    existe = await db.execute(
+                        select(MensajePendienteDB).filter_by(instagram_message_id=comment_id)
+                    )
+                    if not existe.scalars().first():
+                        background_tasks.add_task(
+                            procesar_y_guardar_borrador,
+                            ig_message_id=comment_id,
+                            sender_id=sender_id,
+                            user_message=texto,
+                            post_caption="Comentario en publicación de @otrabogota",
+                        )
+
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Endpoints Privados (Protegidos con X-API-Key para la App Android)
+# ---------------------------------------------------------------------------
 @app.post("/cambiar-estado", dependencies=[Depends(exigir_clave)])
 def cambiar_estado(activar: bool):
     estado_agente["activo"] = activar
@@ -121,78 +250,111 @@ def cambiar_estado(activar: bool):
 
 
 @app.post("/simular-mensaje", dependencies=[Depends(exigir_clave)])
-def simular_mensaje(datos: MensajeSimulado):
+async def simular_mensaje(
+    datos: MensajeSimulado,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     if not estado_agente["activo"]:
         raise HTTPException(
             status_code=403,
-            detail="Acción bloqueada: el agente está PAUSADO. No se pueden procesar mensajes.",
+            detail="Acción bloqueada: el agente está PAUSADO.",
         )
 
-    # Pasamos el comentario y el caption del post a la lógica de aprobación
-    sugerencia = aprobacion.obtener_respuesta_sugerida(datos.texto_mensaje, datos.post_caption)
+    fake_ig_id = f"sim_{datos.usuario_origen}_{hash(datos.texto_mensaje)}"
 
-    nuevo_borrador = {
-        "id_mensaje": next(_contador_ids),
-        "usuario": datos.usuario_origen,
-        "mensaje_recibido": datos.texto_mensaje,
-        "borrador_gemini": sugerencia,
-        "estado": "pendiente_aprobacion",
-        "post_caption": datos.post_caption,  # <--- Contexto guardado para la App Android
-    }
-    bandeja_borradores.append(nuevo_borrador)
+    resultado = await db.execute(
+        select(MensajePendienteDB).filter_by(instagram_message_id=fake_ig_id)
+    )
+    if resultado.scalars().first():
+        raise HTTPException(
+            status_code=400, detail="Este mensaje simulado ya fue registrado."
+        )
+
+    background_tasks.add_task(
+        procesar_y_guardar_borrador,
+        ig_message_id=fake_ig_id,
+        sender_id=datos.usuario_origen,
+        user_message=datos.texto_mensaje,
+        post_caption=datos.post_caption or "Publicación de @otrabogota",
+    )
 
     return {
-        "resultado": "borrador_creado",
-        "advertencia": "El mensaje NO se ha publicado en Instagram. Está esperando aprobación humana.",
-        "detalle_borrador": nuevo_borrador,
+        "resultado": "procesando_en_segundo_plano",
+        "mensaje": "El mensaje fue recibido. Gemini está generando el borrador en segundo plano.",
     }
 
 
 @app.get("/ver-pendientes", dependencies=[Depends(exigir_clave)])
-def ver_pendientes():
-    pendientes = [b for b in bandeja_borradores if b["estado"] == "pendiente_aprobacion"]
+async def ver_pendientes(db: AsyncSession = Depends(get_db)):
+    resultado = await db.execute(
+        select(MensajePendienteDB).filter_by(status="pending")
+    )
+    pendientes = resultado.scalars().all()
+
+    lista_formateada = [
+        {
+            "id_mensaje": p.id,
+            "usuario": p.sender_id,
+            "mensaje_recibido": p.user_message,
+            "borrador_gemini": p.draft_response,
+            "estado": p.status,
+            "post_caption": p.post_caption,
+        }
+        for p in pendientes
+    ]
+
     return {
         "cuenta": estado_agente["cuenta"],
-        "total_pendientes": len(pendientes),
-        "bandeja": pendientes,
+        "total_pendientes": len(lista_formateada),
+        "bandeja": lista_formateada,
     }
 
 
 @app.post("/aprobar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
-def aprobar_borrador(id_mensaje: int):
+async def aprobar_borrador(
+    id_mensaje: int, db: AsyncSession = Depends(get_db)
+):
     _exigir_agente_activo()
-    borrador = _buscar_borrador(id_mensaje)
+    borrador = await _buscar_borrador(db, id_mensaje)
 
-    borrador["estado"] = "aprobado"
+    borrador.status = "approved"
+    await db.commit()
 
     return {
         "resultado": "exito",
-        "mensaje": f"Borrador #{id_mensaje} aprobado. Aún NO se publica en Instagram (modo simulación).",
-        "contenido_aprobado": borrador["borrador_gemini"],
+        "mensaje": f"Borrador #{id_mensaje} aprobado.",
+        "contenido_aprobado": borrador.draft_response,
     }
 
 
 @app.post("/editar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
-def editar_borrador(id_mensaje: int, datos: DatosEdicion):
+async def editar_borrador(
+    id_mensaje: int, datos: DatosEdicion, db: AsyncSession = Depends(get_db)
+):
     _exigir_agente_activo()
-    borrador = _buscar_borrador(id_mensaje)
+    borrador = await _buscar_borrador(db, id_mensaje)
 
-    borrador["borrador_gemini"] = datos.nuevo_texto.strip()
-    borrador["estado"] = "editado_y_aprobado"
+    borrador.draft_response = datos.nuevo_texto.strip()
+    borrador.status = "edited_and_approved"
+    await db.commit()
 
     return {
         "resultado": "exito",
-        "mensaje": f"Borrador #{id_mensaje} editado y aprobado. Aún NO se publica en Instagram (modo simulación).",
-        "contenido_aprobado": borrador["borrador_gemini"],
+        "mensaje": f"Borrador #{id_mensaje} editado y aprobado.",
+        "contenido_aprobado": borrador.draft_response,
     }
 
 
 @app.post("/rechazar-borrador/{id_mensaje}", dependencies=[Depends(exigir_clave)])
-def rechazar_borrador(id_mensaje: int):
-    borrador = _buscar_borrador(id_mensaje)
-    borrador["estado"] = "rechazado"
+async def rechazar_borrador(
+    id_mensaje: int, db: AsyncSession = Depends(get_db)
+):
+    borrador = await _buscar_borrador(db, id_mensaje)
+    borrador.status = "rejected"
+    await db.commit()
 
     return {
         "resultado": "exito",
-        "mensaje": f"Borrador #{id_mensaje} rechazado. No se publicará nada.",
+        "mensaje": f"Borrador #{id_mensaje} rechazado.",
     }
